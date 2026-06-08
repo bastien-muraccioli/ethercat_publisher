@@ -1,0 +1,8 @@
+build/
+logs/
+*.o
+*.so
+*.a
+*.swp
+*.user
+compile_commands.json
