@@ -59,22 +59,45 @@ colcon build --cmake-args -DSOEM_DIR=/path/to/your/SOEM
 
 ```bash
 cd ~/bota_ws
-colcon build --packages-select ethercat_publisher \
-             --cmake-args -DCMAKE_BUILD_TYPE=RelWithDebInfo
+colcon build --packages-select ethercat_publisher \ --cmake-args -DCMAKE_BUILD_TYPE=RelWithDebInfo
 source install/setup.bash
 ```
+Important
+- Build without `--symlink-install`.
+- Re-apply capabilities after every rebuild.
+
 
 ---
 
 ## Capabilities (required once after every rebuild)
 
-The node needs raw socket access and real-time scheduling. Grant both without
-running as root:
+The node requires:
+- raw socket access for SOEM,
+- network administration capability for EtherCAT NIC access,
+- real-time scheduling for the 1 kHz cyclic loop.
+
+Grant capabilities to the executable after every rebuild:
 
 ```bash
-sudo setcap cap_net_raw,cap_sys_nice=+ep \
+sudo setcap cap_net_raw,cap_net_admin,cap_sys_nice=+ep \
   ~/bota_ws/install/ethercat_publisher/lib/ethercat_publisher/ethercat_publisher_node
 ```
+
+Verify:
+
+```bash
+getcap \
+  ~/bota_ws/install/ethercat_publisher/lib/ethercat_publisher/ethercat_publisher_node
+```
+
+Expected output:
+```bash
+cap_net_admin,cap_net_raw,cap_sys_nice=ep
+```
+
+Notes:
+- Rebuilding the package removes Linux capabilities because the executable is recreated.
+- Do NOT use `colcon build --symlink-install` for this package, as Linux capabilities may not propagate correctly through symlinks.
 
 ---
 
@@ -125,9 +148,13 @@ PC (enx00e04c68027b)
 
 ## Notes
 
-- The Bota PDO layout was reverse-engineered from the raw EtherCAT frames.
-  `libBotaDriverExposed.so` (from `bota_driver_ros2`) is **not** used — it is
-  installed on the system but never launched.
-- Only one process may call `ecx_init` on the NIC at a time. Do not run
-  `bota_driver_node` alongside this node.
-- EL3102 voltage conversion: `voltage = (raw_int16 / 32767.0) * 10.0`
+- The node operates as the sole EtherCAT master on the bus.
+- `libBotaDriverExposed.so` from `bota_driver_ros2` is installed on the system but never launched.
+- Do not run `bota_driver_node` or any second EtherCAT master simultaneously.
+- The cyclic EtherCAT loop runs at 1 kHz using `clock_nanosleep` with `SCHED_FIFO`.
+- ROS 2 publishing is decoupled from the EtherCAT real-time thread through cached messages and a ROS timer publisher.
+- Slave recovery is automatically attempted if working counter mismatches persist.
+- The EL3102 PDO layout is decoded manually from raw EtherCAT bytes because Beckhoff compact PDO mapping does not match the default packed struct layout.
+- EL3102 voltage conversion:
+`voltage = (raw_int16 / 32767.0) * 10.0`
+- The Bota SensONE PDO layout was reverse-engineered from raw EtherCAT traffic.
