@@ -1,8 +1,15 @@
 build/
+devel/
+install/
+log/
 logs/
+
 *.o
 *.so
 *.a
-*.swp
-*.user
+*.pyc
+__pycache__/
+
 compile_commands.json
+.vscode/
+.idea/
