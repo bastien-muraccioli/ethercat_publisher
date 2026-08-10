@@ -1,0 +1,15 @@
+build/
+devel/
+install/
+log/
+logs/
+
+*.o
+*.so
+*.a
+*.pyc
+__pycache__/
+
+compile_commands.json
+.vscode/
+.idea/
