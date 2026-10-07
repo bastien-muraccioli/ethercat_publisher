@@ -1,13 +1,8 @@
 cmake_minimum_required(VERSION 3.14)
 project(ethercat_publisher)
 
-# ── Require C++17 ─────────────────────────────────────────────────────────────
 if(NOT CMAKE_CXX_STANDARD)
   set(CMAKE_CXX_STANDARD 17)
-endif()
-
-if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-  add_compile_options(-Wall -Wextra -Wpedantic -O2)
 endif()
 
 # ── ROS 2 dependencies ────────────────────────────────────────────────────────
@@ -17,75 +12,59 @@ find_package(std_msgs      REQUIRED)
 find_package(sensor_msgs   REQUIRED)
 find_package(geometry_msgs REQUIRED)
 
-# ── SOEM ─────────────────────────────────────────────────────────────────────
-# SOEM is built from source. Point cmake to it via -DSOEM_DIR=<path>
-# or let it auto-detect from the default ~/SOEM location.
-#
-# Usage:
-#   colcon build ... --cmake-args -DSOEM_DIR=/path/to/SOEM
-#
-# If SOEM_DIR is not passed, we try the default ~/SOEM path as a convenience
-# for the primary developer. CI / other developers must pass -DSOEM_DIR.
+# ── SOEM (>= 2.0) ─────────────────────────────────────────────────────────────
+option(ETHERCAT_PUBLISHER_FETCH_SOEM "Download and build SOEM if it is not found" ON)
+set(SOEM_GIT_TAG "v2.0.0" CACHE STRING "SOEM version to fetch")
 
-if(NOT DEFINED SOEM_DIR)
-  set(SOEM_DIR "$ENV{HOME}/SOEM")
-  message(STATUS "SOEM_DIR not set — using default: ${SOEM_DIR}")
+set(_soem_ok FALSE)
+find_package(soem CONFIG QUIET)
+if(soem_FOUND AND TARGET soem)
+  get_target_property(_soem_inc soem INTERFACE_INCLUDE_DIRECTORIES)
+  find_file(_soem_header soem/soem.h PATHS ${_soem_inc} NO_DEFAULT_PATH NO_CACHE)
+  if(_soem_header)
+    set(_soem_ok TRUE)
+    message(STATUS "Using installed SOEM: ${soem_DIR}")
+  else()
+    message(STATUS "Ignoring SOEM at ${soem_DIR}: not SOEM >= 2.0 (no soem/soem.h)")
+  endif()
 endif()
 
-set(SOEM_INCLUDE_DIRS
-  ${SOEM_DIR}/include
-  ${SOEM_DIR}/build/include
-  ${SOEM_DIR}/osal
-  ${SOEM_DIR}/osal/linux
-  ${SOEM_DIR}/oshw/linux
-)
-
-set(SOEM_LIBRARY ${SOEM_DIR}/build/libsoem.a)
-
-if(NOT EXISTS ${SOEM_LIBRARY})
-  message(FATAL_ERROR
-    "SOEM static library not found at ${SOEM_LIBRARY}.\n"
-    "Build SOEM first:\n"
-    "  cd ~/SOEM && mkdir -p build && cd build && cmake .. && make\n"
-    "Or pass the correct path:\n"
-    "  colcon build --cmake-args -DSOEM_DIR=/path/to/SOEM")
+if(NOT _soem_ok)
+  if(NOT ETHERCAT_PUBLISHER_FETCH_SOEM)
+    message(FATAL_ERROR "SOEM >= 2.0 not found and ETHERCAT_PUBLISHER_FETCH_SOEM is OFF")
+  endif()
+  message(STATUS "Fetching SOEM ${SOEM_GIT_TAG}")
+  include(FetchContent)
+  FetchContent_Declare(soem_src
+    GIT_REPOSITORY https://github.com/OpenEtherCATsociety/SOEM.git
+    GIT_TAG        ${SOEM_GIT_TAG}
+    GIT_SHALLOW    TRUE
+    EXCLUDE_FROM_ALL
+  )
+  FetchContent_MakeAvailable(soem_src)
 endif()
 
-message(STATUS "Using SOEM: ${SOEM_LIBRARY}")
+if(NOT TARGET soem)
+  message(FATAL_ERROR "SOEM target 'soem' is not available")
+endif()
 
 # ── Executable ───────────────────────────────────────────────────────────────
-add_executable(ethercat_publisher_node
-  src/ethercat_publisher.cpp
-)
+add_executable(ethercat_publisher_node src/ethercat_publisher.cpp)
 
-target_include_directories(ethercat_publisher_node PRIVATE
-  include
-  ${SOEM_INCLUDE_DIRS}
-)
+if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+  target_compile_options(ethercat_publisher_node PRIVATE -Wall -Wextra -Wpedantic -O2)
+endif()
+
+target_include_directories(ethercat_publisher_node PRIVATE include)
 
 ament_target_dependencies(ethercat_publisher_node
-  rclcpp
-  std_msgs
-  sensor_msgs
-  geometry_msgs
-)
+  rclcpp std_msgs sensor_msgs geometry_msgs)
 
-target_link_libraries(ethercat_publisher_node
-  ${SOEM_LIBRARY}
-  pthread
-)
+target_link_libraries(ethercat_publisher_node soem)   # brings includes + pthread/rt
 
 # ── Install ───────────────────────────────────────────────────────────────────
-install(TARGETS ethercat_publisher_node
-  DESTINATION lib/${PROJECT_NAME}
-)
-
-install(DIRECTORY include/
-  DESTINATION include
-)
-
-install(DIRECTORY launch/
-  DESTINATION share/${PROJECT_NAME}/launch
-)
+install(TARGETS ethercat_publisher_node DESTINATION lib/${PROJECT_NAME})
+install(DIRECTORY include/ DESTINATION include)
+install(DIRECTORY launch/  DESTINATION share/${PROJECT_NAME}/launch)
 
 ament_package()
