@@ -90,6 +90,18 @@ private:
     int                     tare_samples_ = 200;
     bool                    tare_active_  = false;
 
+    // ── Bota configuration over CoE/SDO ──────────────────────────────────────
+    void configure_bota();      // optional filter writes, then log_bota_config()
+    void log_bota_config();     // read + print the current sensor configuration
+    bool sdo_read (uint16_t index, uint8_t sub, uint32_t & value);
+    bool sdo_write(uint16_t index, uint8_t sub, uint32_t value, int size);
+
+    // ── Real update-rate measurement (RT thread only) ────────────────────────
+    bool                  report_update_rate_ = true;
+    std::array<double, 6> last_ft_raw_{};
+    uint64_t              ft_frames_  = 0;   // valid EtherCAT frames processed
+    uint64_t              ft_changes_ = 0;   // frames where the F/T values changed
+
     // ── Publishers ───────────────────────────────────────────────────────────
     rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr           pub_voltage_;
     rclcpp::Publisher<geometry_msgs::msg::WrenchStamped>::SharedPtr pub_wrench_;

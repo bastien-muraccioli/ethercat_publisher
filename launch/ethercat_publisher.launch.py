@@ -18,12 +18,26 @@ ARGS = [
     # Software tare
     ("tare_service",  "/bota_ft_sensor/tare", "Name of the std_srvs/Trigger tare service"),
     ("tare_samples",  "200",                  "Samples averaged by the tare (1 kHz -> 200 = 0.2 s)"),
+    # Bota filter, written over SDO at startup (default: 1 kHz). -1 = keep the value stored on the sensor
+    ("bota_sinc_length", "51", "Sinc filter length, rate ~ 51200/sinc: 51 = 1 kHz, 64 = 800 Hz, 128 = 400 Hz; -1 = keep sensor value"),
+    ("bota_fir_disable", "-1", "1 = FIR filter off, 0 = on"),
+    ("bota_fast_enable", "-1", "1 = FAST (spike) filter on, 0 = off"),
+    ("bota_chop_enable", "-1", "1 = CHOP on, 0 = off"),
+    # Log the real EtherCAT loop rate and the rate of new F/T samples every 5 s
+    ("report_update_rate", "true", "Log measured sensor update rate"),
 ]
+
+INT_ARGS = ["tare_samples", "bota_sinc_length", "bota_fir_disable",
+            "bota_fast_enable", "bota_chop_enable"]
+BOOL_ARGS = ["report_update_rate"]
 
 
 def generate_launch_description():
     params = {name: LaunchConfiguration(name) for name, _, _ in ARGS}
-    params["tare_samples"] = ParameterValue(LaunchConfiguration("tare_samples"), value_type=int)
+    for name in INT_ARGS:
+        params[name] = ParameterValue(LaunchConfiguration(name), value_type=int)
+    for name in BOOL_ARGS:
+        params[name] = ParameterValue(LaunchConfiguration(name), value_type=bool)
 
     return LaunchDescription(
         [DeclareLaunchArgument(name, default_value=default, description=desc)

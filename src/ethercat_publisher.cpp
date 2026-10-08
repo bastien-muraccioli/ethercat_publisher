@@ -25,6 +25,14 @@ EthercatPublisher::EthercatPublisher()
     declare_parameter("imu_frame",     "FT_sensor_imu");
     declare_parameter("tare_service", "/bota_ft_sensor/tare");
     declare_parameter("tare_samples", 200);   // 200 samples = 0.2 s at 1 kHz
+
+    // Bota filter settings written at startup (-1 = keep what is stored on the sensor)
+    declare_parameter("bota_sinc_length", 51);   // rate ≈ 51200/sinc: 51 = 1 kHz, 64 = 800 Hz, 128 = 400 Hz. -1 = keep sensor value
+    declare_parameter("bota_fir_disable", -1);   // 1 = FIR off, 0 = FIR on
+    declare_parameter("bota_fast_enable", -1);   // 1 = FAST (spike) filter on
+    declare_parameter("bota_chop_enable", -1);   // 1 = CHOP on
+    declare_parameter("report_update_rate", true);
+    report_update_rate_ = get_parameter("report_update_rate").as_bool();
     tare_samples_ = get_parameter("tare_samples").as_int();
 
     tare_srv_ = create_service<std_srvs::srv::Trigger>(
@@ -102,6 +110,10 @@ bool EthercatPublisher::init_ethercat()
         return false;
     }
 
+    // Slaves are in PRE-OP here: mailbox (SDO) access works, PDOs not mapped yet.
+    // ecx_config_map_group() below requests SAFE-OP, so configure before it.
+    configure_bota();
+
     ecx_config_map_group(&ctx_, io_map_, 0);
     ecx_configdc(&ctx_);
     expected_wkc_ =
@@ -150,6 +162,7 @@ void EthercatPublisher::cyclic_loop()
     clock_gettime(CLOCK_MONOTONIC, &next);
 
     int lost_frames = 0;
+    auto rate_t0 = std::chrono::steady_clock::now();
 
     while (running_) {
         // ── Advance deadline by one cycle ─────────────────────────────────────
@@ -183,6 +196,19 @@ void EthercatPublisher::cyclic_loop()
         // ── Cache latest sensor data ──────────────────────────────────────────
         process_el3102(stamp);
         process_bota(stamp);
+
+        // ── Report real sensor update rate every 5 s ──────────────────────────
+        const auto t  = std::chrono::steady_clock::now();
+        const double dt = std::chrono::duration<double>(t - rate_t0).count();
+        if (dt >= 5.0) {
+            if (report_update_rate_) {
+                RCLCPP_INFO(get_logger(),
+                    "EtherCAT loop %.0f Hz | new Bota F/T samples %.0f Hz",
+                    ft_frames_ / dt, ft_changes_ / dt);
+            }
+            ft_frames_ = ft_changes_ = 0;
+            rate_t0 = t;
+        }
     }
 }
 
@@ -228,6 +254,13 @@ void EthercatPublisher::process_bota(const rclcpp::Time & stamp)
     const std::array<double, 6> raw = {
         pdo->force_x,  pdo->force_y,  pdo->force_z,
         pdo->torque_x, pdo->torque_y, pdo->torque_z };
+
+    // A changed value means the sensor produced a new sample since the last frame
+    ++ft_frames_;
+    if (raw != last_ft_raw_) {
+        ++ft_changes_;
+        last_ft_raw_ = raw;
+    }
 
     std::array<double, 6> off;
     {
@@ -298,6 +331,119 @@ void EthercatPublisher::publish_cached_data()
     pub_voltage_->publish(latest_voltage_);
     pub_wrench_->publish(latest_wrench_);
     pub_imu_->publish(latest_imu_);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ── Bota SDO configuration ───────────────────────────────────────────────────
+// Object dictionary (Bota F/T sensor user manual, EtherCAT SDO table):
+//   0x8006:01 Sinc length   0x8006:02 FIR disable   0x8006:03 FAST enable   0x8006:04 CHOP enable
+//   0x8010:01 Calibration matrix active   0x8010:02 Temperature compensation   0x8010:03 IMU active
+//   0x8011:00 Sampling rate [Hz] (read-only, reflects the filter settings)
+//   0x8030:01 Control command (0x01 = save parameters to flash) — NOT used here
+static constexpr uint16_t OD_FT_FILTER     = 0x8006;
+static constexpr uint16_t OD_DEVICE_CONFIG = 0x8010;
+static constexpr uint16_t OD_SAMPLING_RATE = 0x8011;
+
+bool EthercatPublisher::sdo_read(uint16_t index, uint8_t sub, uint32_t & value)
+{
+    uint8_t buf[4] = {0, 0, 0, 0};
+    int size = sizeof(buf);
+    const int wkc = ecx_SDOread(&ctx_, SLAVE_BOTA, index, sub, false,
+                                &size, buf, EC_TIMEOUTRXM);
+    if (wkc <= 0)
+        return false;
+    value = 0;
+    for (int i = 0; i < size && i < 4; ++i)       // little-endian, any width ≤ 4
+        value |= static_cast<uint32_t>(buf[i]) << (8 * i);
+    return true;
+}
+
+bool EthercatPublisher::sdo_write(uint16_t index, uint8_t sub, uint32_t value, int size)
+{
+    uint8_t buf[4];
+    for (int i = 0; i < 4; ++i)
+        buf[i] = static_cast<uint8_t>(value >> (8 * i));
+    const int wkc = ecx_SDOwrite(&ctx_, SLAVE_BOTA, index, sub, false,
+                                 size, buf, EC_TIMEOUTRXM);
+    if (wkc <= 0) {
+        while (ecx_iserror(&ctx_))
+            RCLCPP_ERROR(get_logger(), "SDO error: %s", ecx_elist2string(&ctx_));
+        return false;
+    }
+    return true;
+}
+
+void EthercatPublisher::configure_bota()
+{
+    const auto & s = ctx_.slavelist[SLAVE_BOTA];
+
+    // ecx_config_init() only *requests* PRE-OP. SOEM 2.x refuses mailbox (SDO)
+    // traffic until the slave's cached state is >= PRE-OP, so wait for it here.
+    const uint16_t st = ecx_statecheck(&ctx_, SLAVE_BOTA, EC_STATE_PRE_OP, EC_TIMEOUTSTATE);
+    if ((st & 0x0F) < EC_STATE_PRE_OP) {
+        RCLCPP_ERROR(get_logger(),
+            "Bota did not reach PRE-OP (state=0x%02X): cannot read/write its configuration", st);
+        return;
+    }
+
+    RCLCPP_INFO(get_logger(), "Slave %d: '%s' (vendor 0x%08X, product 0x%08X)",
+        SLAVE_BOTA, s.name, static_cast<unsigned>(s.eep_man), static_cast<unsigned>(s.eep_id));
+
+    struct Setting { const char * param; uint8_t sub; int size; };
+    const Setting settings[] = {
+        {"bota_sinc_length", 0x01, 2},
+        {"bota_fir_disable", 0x02, 1},
+        {"bota_fast_enable", 0x03, 1},
+        {"bota_chop_enable", 0x04, 1},
+    };
+
+    bool wrote = false;
+    for (const auto & st : settings) {
+        const int64_t v = get_parameter(st.param).as_int();
+        if (v < 0)
+            continue;   // keep the value stored on the sensor
+        if (st.sub == 0x01 && v != 51 && v != 64 && v != 128 &&
+            v != 205 && v != 256 && v != 512) {
+            RCLCPP_WARN(get_logger(), "%s=%ld is not a documented value "
+                "(51, 64, 128, 205, 256, 512), skipping", st.param, static_cast<long>(v));
+            continue;
+        }
+        if (sdo_write(OD_FT_FILTER, st.sub, static_cast<uint32_t>(v), st.size)) {
+            RCLCPP_INFO(get_logger(), "Set %s = %ld", st.param, static_cast<long>(v));
+            wrote = true;
+        } else {
+            RCLCPP_ERROR(get_logger(), "Failed to set %s", st.param);
+        }
+    }
+    if (wrote)   // give the sensor time to apply the new filter before reading back
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+    log_bota_config();
+
+    // The cyclic loop runs at 1 kHz: warn if the sensor produces fewer samples
+    uint32_t rate = 0;
+    if (sdo_read(0x8011, 0x00, rate) && rate < 1000) {
+        RCLCPP_WARN(get_logger(),
+            "Bota sampling rate is %u Hz (< 1 kHz): consecutive messages will repeat "
+            "the same sample. Use bota_sinc_length:=51 for 1 kHz (rate ~ 51200 / sinc).", rate);
+    }
+}
+
+void EthercatPublisher::log_bota_config()
+{
+    auto rd = [this](uint16_t idx, uint8_t sub) -> std::string {
+        uint32_t v = 0;
+        return sdo_read(idx, sub, v) ? std::to_string(v) : std::string("?");
+    };
+
+    RCLCPP_INFO(get_logger(),
+        "Bota config: sinc length=%s, FIR disable=%s, FAST=%s, CHOP=%s | "
+        "calibration=%s, temp. comp.=%s, IMU=%s | sampling rate=%s Hz",
+        rd(OD_FT_FILTER, 0x01).c_str(), rd(OD_FT_FILTER, 0x02).c_str(),
+        rd(OD_FT_FILTER, 0x03).c_str(), rd(OD_FT_FILTER, 0x04).c_str(),
+        rd(OD_DEVICE_CONFIG, 0x01).c_str(), rd(OD_DEVICE_CONFIG, 0x02).c_str(),
+        rd(OD_DEVICE_CONFIG, 0x03).c_str(),
+        rd(OD_SAMPLING_RATE, 0x00).c_str());
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

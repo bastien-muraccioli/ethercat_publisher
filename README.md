@@ -26,6 +26,7 @@ service for the force/torque sensor.
 - [Tare / calibration](#tare--calibration)
 - [Shell aliases](#shell-aliases)
 - [Parameters](#parameters)
+- [Bota sensor configuration](#bota-sensor-configuration)
 - [Troubleshooting](#troubleshooting)
 - [Implementation notes](#implementation-notes)
 
@@ -257,6 +258,66 @@ ros2 launch ethercat_publisher ethercat_publisher.launch.py nic:=enx00e04c68027b
 | `imu_frame` | `FT_sensor_imu` | `frame_id` of the Imu messages |
 | `tare_service` | `/bota_ft_sensor/tare` | Name of the tare service |
 | `tare_samples` | `200` | Number of samples averaged by the tare |
+| `bota_sinc_length` | `51` | Bota sinc filter length written at startup: `51` = 1 kHz (`-1` = keep sensor value) |
+| `bota_fir_disable` | `-1` | `1` = FIR off, `0` = FIR on |
+| `bota_fast_enable` | `-1` | `1` = FAST spike filter on |
+| `bota_chop_enable` | `-1` | `1` = CHOP on |
+| `report_update_rate` | `true` | Log the measured loop rate and new-sample rate every 5 s |
+
+---
+
+## Bota sensor configuration
+
+The publishing rate (1 kHz) is set by a ROS timer and does **not** prove that
+the sensor produces 1000 new samples per second. At startup the node reads the
+Bota configuration over SDO and logs it:
+
+```
+Bota config: sinc length=64, FIR disable=1, FAST=0, CHOP=0 | calibration=1, temp. comp.=0, IMU=1 | sampling rate=800 Hz
+```
+
+Every 5 s it also logs the **measured** rate of new force/torque samples
+(frames whose values changed):
+
+```
+EtherCAT loop 1000 Hz | new Bota F/T samples 800 Hz
+```
+
+The force/torque output rate depends on the sinc length. Measured on a
+`BFT-SENS-ECAT-M8`, it follows **rate ≈ 51 200 / sinc length**:
+
+| Sinc length | F/T output rate |
+|---|---|
+| 51 | ≈ 1000 Hz |
+| 64 | 800 Hz |
+| 128 | 400 Hz |
+| 205 | 250 Hz |
+| 256 | 200 Hz |
+| 512 | 100 Hz |
+
+> Bota's user manual also contains a table listing 1000 Hz for sinc 51, 64
+> and 128. That table is wrong for this sensor: trust the `sampling rate`
+> read back from object `0x8011` and the measured `new Bota F/T samples` rate.
+
+The IMU is a separate chip and is not affected by these settings.
+
+By default the node writes **sinc length 51** (1 kHz). A shorter filter means
+more bandwidth and more noise. If the sensor reports less than 1000 Hz, the
+node logs a warning. To change it:
+
+```bash
+ros2 launch ethercat_publisher ethercat_publisher.launch.py bota_sinc_length:=64   # 800 Hz, less noise
+ros2 launch ethercat_publisher ethercat_publisher.launch.py bota_sinc_length:=-1   # keep the sensor's stored setting
+```
+
+`0x8006:01` may read back as a different number than the one written (for
+example 768 after writing 128). The sampling rate is the value that matters.
+
+The settings are written in PRE-OP on every start and are **not** saved to the
+sensor's flash, so a power cycle restores the stored configuration.
+
+Relevant objects: `0x8006:01-04` (sinc, FIR, FAST, CHOP), `0x8010:01-03`
+(calibration, temperature compensation, IMU), `0x8011` (sampling rate).
 
 ---
 
