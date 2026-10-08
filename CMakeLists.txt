@@ -11,6 +11,7 @@ find_package(rclcpp        REQUIRED)
 find_package(std_msgs      REQUIRED)
 find_package(sensor_msgs   REQUIRED)
 find_package(geometry_msgs REQUIRED)
+find_package(std_srvs REQUIRED)
 
 # ── SOEM (>= 2.0) ─────────────────────────────────────────────────────────────
 option(ETHERCAT_PUBLISHER_FETCH_SOEM "Download and build SOEM if it is not found" ON)
@@ -58,7 +59,7 @@ endif()
 target_include_directories(ethercat_publisher_node PRIVATE include)
 
 ament_target_dependencies(ethercat_publisher_node
-  rclcpp std_msgs sensor_msgs geometry_msgs)
+  rclcpp std_msgs sensor_msgs geometry_msgs std_srvs)
 
 target_link_libraries(ethercat_publisher_node soem)   # brings includes + pthread/rt
 

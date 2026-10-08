@@ -17,12 +17,20 @@ EthercatPublisher::EthercatPublisher()
 : Node("ethercat_publisher")
 {
     // ── Declare + read ROS parameters ─────────────────────────────────────────
-    declare_parameter("nic",           "enx00e04c68027b");
+    declare_parameter("nic",           "enp45s0");
     declare_parameter("wrench_topic",  "/bus0/ft_sensor0/ft_sensor_readings/wrench");
     declare_parameter("imu_topic",     "/bus0/ft_sensor0/ft_sensor_readings/imu");
     declare_parameter("voltage_topic", "/collision/voltage");
     declare_parameter("wrench_frame",  "FT_sensor_wrench");
     declare_parameter("imu_frame",     "FT_sensor_imu");
+    declare_parameter("tare_service", "/bota_ft_sensor/tare");
+    declare_parameter("tare_samples", 200);   // 200 samples = 0.2 s at 1 kHz
+    tare_samples_ = get_parameter("tare_samples").as_int();
+
+    tare_srv_ = create_service<std_srvs::srv::Trigger>(
+        get_parameter("tare_service").as_string(),
+        std::bind(&EthercatPublisher::on_tare, this,
+                  std::placeholders::_1, std::placeholders::_2));
 
     nic_           = get_parameter("nic").as_string();
     wrench_topic_  = get_parameter("wrench_topic").as_string();
@@ -216,12 +224,31 @@ void EthercatPublisher::process_bota(const rclcpp::Time & stamp)
     geometry_msgs::msg::WrenchStamped wrench;
     wrench.header.stamp    = stamp;
     wrench.header.frame_id = wrench_frame_;
-    wrench.wrench.force.x  = pdo->force_x;
-    wrench.wrench.force.y  = pdo->force_y;
-    wrench.wrench.force.z  = pdo->force_z;
-    wrench.wrench.torque.x = pdo->torque_x;
-    wrench.wrench.torque.y = pdo->torque_y;
-    wrench.wrench.torque.z = pdo->torque_z;
+
+    const std::array<double, 6> raw = {
+        pdo->force_x,  pdo->force_y,  pdo->force_z,
+        pdo->torque_x, pdo->torque_y, pdo->torque_z };
+
+    std::array<double, 6> off;
+    {
+        std::lock_guard<std::mutex> lk(tare_mutex_);
+        if (tare_active_) {
+            for (size_t i = 0; i < 6; ++i) tare_sum_[i] += raw[i];
+            if (++tare_count_ >= tare_samples_) {
+                for (size_t i = 0; i < 6; ++i) ft_offset_[i] = tare_sum_[i] / tare_count_;
+                tare_active_ = false;
+                tare_cv_.notify_all();
+            }
+        }
+        off = ft_offset_;
+    }
+
+    wrench.wrench.force.x  = raw[0] - off[0];
+    wrench.wrench.force.y  = raw[1] - off[1];
+    wrench.wrench.force.z  = raw[2] - off[2];
+    wrench.wrench.torque.x = raw[3] - off[3];
+    wrench.wrench.torque.y = raw[4] - off[4];
+    wrench.wrench.torque.z = raw[5] - off[5];
     {
       std::lock_guard<std::mutex> lock(data_mutex_);
       latest_wrench_ = wrench;  
@@ -308,6 +335,41 @@ bool EthercatPublisher::recover_slaves()
     }
     RCLCPP_ERROR(get_logger(), "Recovery failed — slaves still not in OP (state=0x%02X)", state);
     return false;
+}
+
+void EthercatPublisher::on_tare(
+    const std::shared_ptr<std_srvs::srv::Trigger::Request>,
+    std::shared_ptr<std_srvs::srv::Trigger::Response> res)
+{
+    if (!ethercat_initialized_) {
+        res->success = false;
+        res->message = "EtherCAT not running";
+        return;
+    }
+
+    std::unique_lock<std::mutex> lk(tare_mutex_);
+    tare_sum_.fill(0.0);
+    tare_count_  = 0;
+    tare_active_ = true;
+
+    // The cyclic thread fills the samples; wait for it (with a timeout)
+    const bool done = tare_cv_.wait_for(lk, std::chrono::seconds(2),
+                                        [this] { return !tare_active_; });
+    if (!done) {
+        tare_active_ = false;
+        res->success = false;
+        res->message = "Tare timed out: no valid sensor frames";
+        return;
+    }
+
+    char buf[256];
+    std::snprintf(buf, sizeof(buf),
+        "Tared over %d samples. Offset F=[%.3f %.3f %.3f] T=[%.4f %.4f %.4f]",
+        tare_count_, ft_offset_[0], ft_offset_[1], ft_offset_[2],
+        ft_offset_[3], ft_offset_[4], ft_offset_[5]);
+    res->success = true;
+    res->message = buf;
+    RCLCPP_INFO(get_logger(), "%s", buf);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -12,6 +12,10 @@
 #include <mutex>
 #include <pthread.h>
 
+#include <std_srvs/srv/trigger.hpp>
+#include <array>
+#include <condition_variable>
+
 #include "soem/soem.h"
 
 // ── EtherCAT slave indices ────────────────────────────────────────────────────
@@ -72,6 +76,19 @@ private:
     // ── EtherCAT recovery helper ──────────────────────────────────────────────
     bool recover_slaves();
     void publish_cached_data();
+
+    // ── Tare ─────────────────────────────────────────────────────────────────
+    void on_tare(const std::shared_ptr<std_srvs::srv::Trigger::Request> req,
+                 std::shared_ptr<std_srvs::srv::Trigger::Response> res);
+
+    rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr tare_srv_;
+    std::mutex              tare_mutex_;
+    std::condition_variable tare_cv_;
+    std::array<double, 6>   ft_offset_{};   // fx fy fz tx ty tz
+    std::array<double, 6>   tare_sum_{};
+    int                     tare_count_   = 0;
+    int                     tare_samples_ = 200;
+    bool                    tare_active_  = false;
 
     // ── Publishers ───────────────────────────────────────────────────────────
     rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr           pub_voltage_;
